@@ -2,8 +2,14 @@ const Transaction = require("../models/Transaction");
 const Partner = require("../models/Partner");
 const mongoose = require("mongoose");
 
-// Create transaction (UPDATED with borrow/repay logic)
+// ============================================
+// ✅ FIXED: Create transaction with transaction safety
+// ============================================
 exports.createTransaction = async (req, res) => {
+  // ✅ FIXED: Start MongoDB session for atomic operations
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
   try {
     const transactionData = { ...req.body };
     
@@ -11,6 +17,8 @@ exports.createTransaction = async (req, res) => {
     if (req.body.type === "borrow") {
       // For borrow: personName is required
       if (!req.body.personName) {
+        await session.abortTransaction();
+        session.endSession();
         return res.status(400).json({ 
           message: "personName is required for borrow transactions" 
         });
@@ -21,42 +29,56 @@ exports.createTransaction = async (req, res) => {
       transactionData.status = "pending";
     }
     
-    // Handle repay logic
+    // ✅ FIXED: Handle repay logic with transaction safety
     if (req.body.type === "repay") {
       if (!req.body.parentBorrowId) {
+        await session.abortTransaction();
+        session.endSession();
         return res.status(400).json({ 
           message: "parentBorrowId is required for repay transactions" 
         });
       }
       
-      // Find the original borrow
-      const originalBorrow = await Transaction.findById(req.body.parentBorrowId);
+      // Find the original borrow WITH LOCK using session
+      const originalBorrow = await Transaction.findById(req.body.parentBorrowId)
+        .session(session);
+      
       if (!originalBorrow) {
+        await session.abortTransaction();
+        session.endSession();
         return res.status(404).json({ 
           message: "Original borrow transaction not found" 
         });
       }
       
-      // Calculate new remaining amount
+      // ✅ FIXED: Prevent race condition by checking current state
       const currentRemaining = originalBorrow.remainingAmount || originalBorrow.amount;
       const newRemaining = currentRemaining - req.body.amount;
       
-      if (newRemaining < 0) {
+      // ✅ FIXED: Use epsilon for floating point comparison
+      if (newRemaining < -0.01) {
+        await session.abortTransaction();
+        session.endSession();
         return res.status(400).json({ 
-          message: `Repayment amount exceeds remaining balance. Remaining: ${currentRemaining}` 
+          message: `Repayment exceeds remaining balance. Remaining: ${currentRemaining}` 
         });
       }
       
-      // Update original borrow
-      originalBorrow.remainingAmount = newRemaining;
-      originalBorrow.status = newRemaining <= 0 ? "settled" : "partial";
-      await originalBorrow.save();
+      // Update original borrow within session
+      originalBorrow.remainingAmount = Math.max(0, newRemaining);
+      originalBorrow.status = newRemaining <= 0.01 ? "settled" : "partial";
+      await originalBorrow.save({ session });
       
       // Copy personName to repay transaction
       transactionData.personName = originalBorrow.personName;
     }
 
-    const transaction = await Transaction.create(transactionData);
+    // Create transaction within session
+    const [transaction] = await Transaction.create([transactionData], { session });
+    
+    // Commit transaction
+    await session.commitTransaction();
+    session.endSession();
     
     // Populate for response
     const populated = await Transaction.findById(transaction._id)
@@ -70,12 +92,15 @@ exports.createTransaction = async (req, res) => {
     
     res.status(201).json({ success: true, data: populated });
   } catch (error) {
+    // ✅ FIXED: Always abort and end session on error
+    await session.abortTransaction();
+    session.endSession();
     res.status(400).json({ message: error.message });
   }
 };
 
 // ============================================
-// COMPLETE TRANSACTION HISTORY WITH ALL FILTERS (NEW)
+// ✅ FIXED: COMPLETE TRANSACTION HISTORY WITH PROPER FILTER COMBINATION
 // ============================================
 exports.getTransactionHistory = async (req, res) => {
   try {
@@ -87,14 +112,14 @@ exports.getTransactionHistory = async (req, res) => {
       // Date filters
       startDate,
       endDate,
-      filterType = "custom", // day, week, month, 6months, year, custom
+      filterType = "custom",
       
       // Other filters
-      type,        // expense, income, transfer, borrow, repay, partner-transfer, all
+      type,
       projectId,
       accountId,
-      partnerId,   // filter by partner
-      personName,  // filter by person (borrow/repay)
+      partnerId,
+      personName,
       search,
       
       // Sorting
@@ -151,45 +176,55 @@ exports.getTransactionHistory = async (req, res) => {
       }
     }
 
-    // Build main filter
-    const filter = {};
+    // ============================================
+    // ✅ FIXED: Build filter conditions using $and array
+    // This prevents filters from overriding each other
+    // ============================================
+    const conditions = [];
+    
+    // Date condition
     if (Object.keys(dateFilter).length > 0) {
-      filter.date = dateFilter;
+      conditions.push({ date: dateFilter });
     }
 
-    // Type filter
+    // Type condition
     if (type && type !== "all") {
-      filter.type = type;
+      conditions.push({ type });
     }
 
-    // Project filter
+    // Project condition
     if (projectId) {
-      filter.project = projectId;
+      conditions.push({ project: projectId });
     }
 
-    // Account filter
-    if (accountId) {
-      filter.$or = [
-        { fromAccount: accountId },
-        { toAccount: accountId }
-      ];
-    }
-
-    // Partner filter
-    if (partnerId) {
-      filter.$or = [
-        ...(filter.$or || []),
-        { fromPartner: partnerId },
-        { toPartner: partnerId }
-      ];
-    }
-
-    // Person filter (borrow/repay)
+    // Person name condition (borrow/repay)
     if (personName) {
-      filter.personName = { $regex: personName, $options: "i" };
+      conditions.push({ 
+        personName: { $regex: personName, $options: "i" } 
+      });
     }
 
-    // Global search
+    // Account condition (either from or to)
+    if (accountId) {
+      conditions.push({
+        $or: [
+          { fromAccount: accountId },
+          { toAccount: accountId }
+        ]
+      });
+    }
+
+    // Partner condition (either from or to)
+    if (partnerId) {
+      conditions.push({
+        $or: [
+          { fromPartner: partnerId },
+          { toPartner: partnerId }
+        ]
+      });
+    }
+
+    // ✅ FIXED: Global search condition - combines with other filters properly
     if (search) {
       const accounts = await mongoose.model("Account").find({
         name: { $regex: search, $options: "i" }
@@ -203,16 +238,20 @@ exports.getTransactionHistory = async (req, res) => {
       
       const partnerIds = partners.map(p => p._id);
 
-      filter.$or = [
-        ...(filter.$or || []),
-        { description: { $regex: search, $options: "i" } },
-        { personName: { $regex: search, $options: "i" } },
-        { fromPartner: { $in: partnerIds } },
-        { toPartner: { $in: partnerIds } },
-        { fromAccount: { $in: accountIds } },
-        { toAccount: { $in: accountIds } }
-      ];
+      conditions.push({
+        $or: [
+          { description: { $regex: search, $options: "i" } },
+          { personName: { $regex: search, $options: "i" } },
+          { fromPartner: { $in: partnerIds } },
+          { toPartner: { $in: partnerIds } },
+          { fromAccount: { $in: accountIds } },
+          { toAccount: { $in: accountIds } }
+        ]
+      });
     }
+
+    // ✅ FIXED: Build final filter with $and
+    const filter = conditions.length > 0 ? { $and: conditions } : {};
 
     // Pagination
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -294,9 +333,9 @@ exports.getTransactionHistory = async (req, res) => {
           if (t.fromPartner && t.toPartner) {
             description = `🤝 ${t.fromPartner.name} → ${t.toPartner.name}`;
             if (t.paymentMode === "internal") {
-              description += ` (Partner transfer)`;
+              description += ` (internal)`;
             } else if (t.paymentMode === "cash") {
-              description += ` (Cash)`;
+              description += ` (cash)`;
             } else {
               description += ` via ${t.paymentAccount?.name || 'bank'}`;
             }
@@ -333,8 +372,7 @@ exports.getTransactionHistory = async (req, res) => {
           totalBorrowed: 0,
           totalRepaid: 0,
           totalPartnerTransfers: 0,
-          count: 0,
-          netFlow: 0
+          count: 0
         },
         netFlow: (stats[0]?.totalIncome || 0) - (stats[0]?.totalExpense || 0),
         pagination: {
@@ -361,7 +399,9 @@ exports.getTransactionHistory = async (req, res) => {
   }
 };
 
-// Get all transactions with filtering, search, pagination (keep existing)
+// ============================================
+// Get all transactions with filtering (KEEP EXISTING - already good)
+// ============================================
 exports.getTransactions = async (req, res) => {
   try {
     const {
@@ -454,7 +494,9 @@ exports.getTransactions = async (req, res) => {
   }
 };
 
+// ============================================
 // Get all borrows with their repayments
+// ============================================
 exports.getBorrowsWithRepayments = async (req, res) => {
   try {
     const { status, person, page = 1, limit = 20 } = req.query;
@@ -514,7 +556,9 @@ exports.getBorrowsWithRepayments = async (req, res) => {
   }
 };
 
+// ============================================
 // Get borrow summary
+// ============================================
 exports.getBorrowSummary = async (req, res) => {
   try {
     const borrows = await Transaction.find({ type: "borrow" });
@@ -579,37 +623,51 @@ exports.getBorrowSummary = async (req, res) => {
   }
 };
 
-// Repay a borrow
+// ============================================
+// ✅ FIXED: Repay a borrow with transaction safety
+// ============================================
 exports.repayBorrow = async (req, res) => {
+  // ✅ FIXED: Use session for atomic operation
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
   try {
     const { amount, fromAccount, date, description } = req.body;
     const borrowId = req.params.id;
     
-    // Find the original borrow
-    const borrow = await Transaction.findById(borrowId);
+    // Find the original borrow WITH LOCK
+    const borrow = await Transaction.findById(borrowId).session(session);
     if (!borrow) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(404).json({ message: "Borrow transaction not found" });
     }
     
     if (borrow.type !== "borrow") {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({ message: "Transaction is not a borrow" });
     }
     
     // Check if already settled
     const currentRemaining = borrow.remainingAmount || borrow.amount;
     if (currentRemaining <= 0) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({ message: "This borrow is already settled" });
     }
     
     // Check if repayment amount is valid
-    if (amount > currentRemaining) {
+    if (amount > currentRemaining + 0.01) { // Allow tiny floating point error
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({ 
         message: `Amount exceeds remaining balance. Remaining: ${currentRemaining}` 
       });
     }
     
-    // Create repayment transaction
-    const repayment = await Transaction.create({
+    // Create repayment transaction within session
+    const [repayment] = await Transaction.create([{
       date: date || new Date(),
       type: "repay",
       parentBorrowId: borrow._id,
@@ -618,13 +676,17 @@ exports.repayBorrow = async (req, res) => {
       personName: borrow.personName,
       description: description || `Repayment for borrow from ${borrow.personName}`,
       amount
-    });
+    }], { session });
     
     // Update borrow
     const newRemaining = currentRemaining - amount;
-    borrow.remainingAmount = newRemaining;
-    borrow.status = newRemaining <= 0 ? "settled" : "partial";
-    await borrow.save();
+    borrow.remainingAmount = Math.max(0, newRemaining);
+    borrow.status = newRemaining <= 0.01 ? "settled" : "partial";
+    await borrow.save({ session });
+    
+    // Commit transaction
+    await session.commitTransaction();
+    session.endSession();
     
     // Get updated borrow with repayments
     const updatedBorrow = await Transaction.findById(borrowId)
@@ -647,11 +709,15 @@ exports.repayBorrow = async (req, res) => {
       }
     });
   } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
     res.status(400).json({ message: error.message });
   }
 };
 
+// ============================================
 // Get single transaction
+// ============================================
 exports.getTransaction = async (req, res) => {
   try {
     const transaction = await Transaction.findById(req.params.id)
@@ -687,7 +753,9 @@ exports.getTransaction = async (req, res) => {
   }
 };
 
+// ============================================
 // Update transaction
+// ============================================
 exports.updateTransaction = async (req, res) => {
   try {
     // Don't allow updating certain fields for borrows with repayments
@@ -729,12 +797,20 @@ exports.updateTransaction = async (req, res) => {
   }
 };
 
-// Delete transaction
+// ============================================
+// ✅ FIXED: Delete transaction with proper cleanup
+// ============================================
 exports.deleteTransaction = async (req, res) => {
+  // ✅ FIXED: Use session for consistency
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
   try {
-    const transaction = await Transaction.findById(req.params.id);
+    const transaction = await Transaction.findById(req.params.id).session(session);
     
     if (!transaction) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(404).json({ message: "Transaction not found" });
     }
     
@@ -743,9 +819,11 @@ exports.deleteTransaction = async (req, res) => {
       const repayments = await Transaction.countDocuments({
         type: "repay",
         parentBorrowId: transaction._id
-      });
+      }).session(session);
       
       if (repayments > 0) {
+        await session.abortTransaction();
+        session.endSession();
         return res.status(400).json({ 
           message: "Cannot delete borrow with existing repayments. Delete repayments first." 
         });
@@ -754,13 +832,13 @@ exports.deleteTransaction = async (req, res) => {
     
     // If deleting a repayment, update the parent borrow
     if (transaction.type === "repay" && transaction.parentBorrowId) {
-      const parentBorrow = await Transaction.findById(transaction.parentBorrowId);
+      const parentBorrow = await Transaction.findById(transaction.parentBorrowId).session(session);
       if (parentBorrow) {
         const otherRepayments = await Transaction.find({
           type: "repay",
           parentBorrowId: parentBorrow._id,
           _id: { $ne: transaction._id }
-        });
+        }).session(session);
         
         const totalRepaid = otherRepayments.reduce((sum, r) => sum + r.amount, 0);
         const originalAmount = parentBorrow.originalAmount || parentBorrow.amount;
@@ -768,14 +846,21 @@ exports.deleteTransaction = async (req, res) => {
         parentBorrow.remainingAmount = originalAmount - totalRepaid;
         parentBorrow.status = parentBorrow.remainingAmount <= 0 ? "settled" : 
                              (totalRepaid > 0 ? "partial" : "pending");
-        await parentBorrow.save();
+        await parentBorrow.save({ session });
       }
     }
     
-    await transaction.deleteOne();
+    // Delete the transaction
+    await transaction.deleteOne({ session });
+    
+    // Commit transaction
+    await session.commitTransaction();
+    session.endSession();
     
     res.json({ success: true, message: "Transaction deleted successfully" });
   } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
     res.status(500).json({ message: error.message });
   }
 };

@@ -4,7 +4,7 @@ const Project = require("../models/Project");
 const Account = require("../models/Account");
 
 // ============================================
-// PARTNER MANAGEMENT (SIMPLIFIED)
+// PARTNER MANAGEMENT
 // ============================================
 
 // Add partner to project
@@ -42,7 +42,7 @@ exports.addPartnerToProject = async (req, res) => {
   }
 };
 
-// Get all partners for a project (for dropdown)
+// Get all partners for a project
 exports.getProjectPartners = async (req, res) => {
   try {
     const { projectId } = req.params;
@@ -118,10 +118,10 @@ exports.removePartner = async (req, res) => {
 };
 
 // ============================================
-// FIXED: PARTNER TRANSFERS (with correct payment logic)
+// FIXED: PARTNER TRANSFERS (NO DOUBLE COUNTING)
 // ============================================
 
-// Create partner transfer with payment mode
+// Create partner transfer - NO duplicate expense/income created
 exports.createPartnerTransfer = async (req, res) => {
   try {
     const { projectId } = req.params;
@@ -175,16 +175,16 @@ exports.createPartnerTransfer = async (req, res) => {
       project: projectId,
       fromPartner: fromPartnerId,
       toPartner: toPartnerId,
-      description: description || `${fromPartner.name} gave ₹${amount} to ${toPartner.name}`,
+      description: description || `${fromPartner.name} → ${toPartner.name} ₹${amount}`,
       amount
     };
 
     // ============================================
-    // CASE 1: "Me" is NOT involved - Just record (NO bank/cash needed)
+    // CASE 1: "Me" is NOT involved - Simple record
     // ============================================
     if (!isMeInvolved) {
-      // Simple record - no paymentMode, no paymentAccount needed
-      // Just store the transaction as is
+      // Just store the transaction - NO account movement needed
+      transactionData.paymentMode = "internal";
       const transaction = await Transaction.create(transactionData);
 
       const populated = await Transaction.findById(transaction._id)
@@ -195,82 +195,41 @@ exports.createPartnerTransfer = async (req, res) => {
       return res.status(201).json({
         success: true,
         data: populated,
-        message: "Partner transfer recorded successfully (no money movement)"
+        message: "Partner transfer recorded (internal settlement)"
       });
     }
 
     // ============================================
-    // CASE 2: "Me" IS involved - Need payment details
+    // CASE 2: "Me" IS involved - Track how money moved
     // ============================================
     
     // Payment mode is required when Me is involved
     if (!paymentMode) {
       return res.status(400).json({ 
-        message: "Payment mode is required when you (Me) are involved in the transaction" 
+        message: "Payment mode is required when you (Me) are involved" 
       });
     }
 
     transactionData.paymentMode = paymentMode;
 
-    // If I'm PAYING someone (Me → Other)
-    if (fromPartner.name === "Me" && toPartner.name !== "Me") {
-      // If not cash, need account
-      if (paymentMode !== "cash") {
-        if (!paymentAccountId) {
-          return res.status(400).json({ 
-            message: `Payment account is required for ${paymentMode} payment when you are paying` 
-          });
-        }
-        
-        const account = await Account.findById(paymentAccountId);
-        if (!account) {
-          return res.status(404).json({ message: "Payment account not found" });
-        }
-        
-        transactionData.paymentAccount = paymentAccountId;
-        
-        // Create expense from my account
-        await Transaction.create({
-          date: date || new Date(),
-          type: "expense",
-          fromAccount: paymentAccountId,
-          description: `Paid to ${toPartner.name} for project: ${description || "Partner transfer"}`,
-          amount,
-          project: projectId
+    // If paying from bank, track which account
+    if (paymentMode !== "cash" && paymentMode !== "internal") {
+      if (!paymentAccountId) {
+        return res.status(400).json({ 
+          message: `Account is required for ${paymentMode} payment` 
         });
       }
-    }
-    
-    // If I'm RECEIVING money (Other → Me)
-    else if (toPartner.name === "Me" && fromPartner.name !== "Me") {
-      // If not cash, need account where money is received
-      if (paymentMode !== "cash") {
-        if (!paymentAccountId) {
-          return res.status(400).json({ 
-            message: `Payment account is required for ${paymentMode} payment when you are receiving` 
-          });
-        }
-        
-        const account = await Account.findById(paymentAccountId);
-        if (!account) {
-          return res.status(404).json({ message: "Payment account not found" });
-        }
-        
-        transactionData.paymentAccount = paymentAccountId;
-        
-        // Create income to my account
-        await Transaction.create({
-          date: date || new Date(),
-          type: "income",
-          toAccount: paymentAccountId,
-          description: `Received from ${fromPartner.name} for project: ${description || "Partner transfer"}`,
-          amount,
-          project: projectId
-        });
+      
+      const account = await Account.findById(paymentAccountId);
+      if (!account) {
+        return res.status(404).json({ message: "Payment account not found" });
       }
+      
+      transactionData.paymentAccount = paymentAccountId;
     }
 
-    // Create the partner transfer record
+    // ✅ FIXED: ONLY create ONE transaction - the partner transfer itself
+    // NO separate expense/income created
     const transaction = await Transaction.create(transactionData);
 
     const populated = await Transaction.findById(transaction._id)
@@ -281,7 +240,10 @@ exports.createPartnerTransfer = async (req, res) => {
 
     res.status(201).json({
       success: true,
-      data: populated
+      data: populated,
+      message: isMeInvolved ? 
+        "Partner transfer recorded (your money movement tracked)" : 
+        "Partner transfer recorded"
     });
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -385,7 +347,9 @@ exports.getProjectPartnerTransactions = async (req, res) => {
       }
     });
 
-    // Calculate settlements needed
+    // ============================================
+    // FIXED: Settlement algorithm with SORTING
+    // ============================================
     const settlements = [];
     const balances = {};
     
@@ -393,8 +357,13 @@ exports.getProjectPartnerTransactions = async (req, res) => {
       balances[id] = partnerSummary[id].net;
     });
 
-    const debtors = Object.keys(balances).filter(id => balances[id] < 0);
-    const creditors = Object.keys(balances).filter(id => balances[id] > 0);
+    // Get debtors (negative balance) and creditors (positive balance)
+    let debtors = Object.keys(balances).filter(id => balances[id] < 0);
+    let creditors = Object.keys(balances).filter(id => balances[id] > 0);
+
+    // ✅ FIX: Sort debtors by most negative first, creditors by most positive first
+    debtors.sort((a, b) => balances[a] - balances[b]); // Most negative first
+    creditors.sort((a, b) => balances[b] - balances[a]); // Most positive first
 
     let i = 0, j = 0;
     while (i < debtors.length && j < creditors.length) {
@@ -413,15 +382,15 @@ exports.getProjectPartnerTransactions = async (req, res) => {
           to: partnerSummary[creditorId].name,
           toId: creditorId,
           amount: settleAmount,
-          reason: `${partnerSummary[debtorId].name} owes ${partnerSummary[creditorId].name} ₹${settleAmount}`
+          reason: `${partnerSummary[debtorId].name} pays ${partnerSummary[creditorId].name} ₹${settleAmount}`
         });
       }
       
       balances[debtorId] += settleAmount;
       balances[creditorId] -= settleAmount;
       
-      if (balances[debtorId] >= 0) i++;
-      if (balances[creditorId] <= 0) j++;
+      if (Math.abs(balances[debtorId]) < 0.01) i++; // Close to zero
+      if (Math.abs(balances[creditorId]) < 0.01) j++;
     }
 
     res.json({
@@ -476,12 +445,18 @@ exports.getPartnerSettlementReport = async (req, res) => {
       if (toId) partnerNet[toId] += t.amount;
     });
 
-    // Generate settlement plan
+    // ============================================
+    // FIXED: Settlement report with SORTING
+    // ============================================
     const settlements = [];
     const balances = { ...partnerNet };
     
-    const debtorIds = Object.keys(balances).filter(id => balances[id] < 0);
-    const creditorIds = Object.keys(balances).filter(id => balances[id] > 0);
+    let debtorIds = Object.keys(balances).filter(id => balances[id] < 0);
+    let creditorIds = Object.keys(balances).filter(id => balances[id] > 0);
+
+    // ✅ FIX: Sort for optimal settlement
+    debtorIds.sort((a, b) => balances[a] - balances[b]);
+    creditorIds.sort((a, b) => balances[b] - balances[a]);
 
     let i = 0, j = 0;
     while (i < debtorIds.length && j < creditorIds.length) {
@@ -507,8 +482,8 @@ exports.getPartnerSettlementReport = async (req, res) => {
       balances[debtorId] += settleAmount;
       balances[creditorId] -= settleAmount;
       
-      if (balances[debtorId] >= 0) i++;
-      if (balances[creditorId] <= 0) j++;
+      if (Math.abs(balances[debtorId]) < 0.01) i++;
+      if (Math.abs(balances[creditorId]) < 0.01) j++;
     }
 
     // Format partner balances with names
@@ -565,7 +540,7 @@ exports.settlePartner = async (req, res) => {
       project: projectId,
       fromPartner: fromPartnerId,
       toPartner: toPartnerId,
-      description: description || `Settlement: ${fromPartner.name} paid ${toPartner.name} ₹${amount}`,
+      description: description || `Settlement: ${fromPartner.name} → ${toPartner.name} ₹${amount}`,
       amount,
       status: "settled"
     };
@@ -574,7 +549,7 @@ exports.settlePartner = async (req, res) => {
     if (isMeInvolved) {
       if (!paymentMode) {
         return res.status(400).json({ 
-          message: "Payment mode is required when you (Me) are involved in settlement" 
+          message: "Payment mode is required when you (Me) are involved" 
         });
       }
       transactionData.paymentMode = paymentMode;
