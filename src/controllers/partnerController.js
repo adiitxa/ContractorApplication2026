@@ -4,14 +4,14 @@ const Project = require("../models/Project");
 const Account = require("../models/Account");
 
 // ============================================
-// PARTNER MANAGEMENT
+// PARTNER MANAGEMENT - UPDATED WITH isSelf
 // ============================================
 
-// Add partner to project
+// Add partner to project - UPDATED with isSelf
 exports.addPartnerToProject = async (req, res) => {
   try {
     const { projectId } = req.params;
-    const { name, notes } = req.body;
+    const { name, notes, isSelf } = req.body;  // ✅ Added isSelf
 
     // Verify project exists
     const project = await Project.findById(projectId);
@@ -27,10 +27,24 @@ exports.addPartnerToProject = async (req, res) => {
       });
     }
 
+    // ✅ If isSelf is true, ensure no other self exists
+    if (isSelf) {
+      const existingSelf = await Partner.findOne({ 
+        project: projectId, 
+        isSelf: true 
+      });
+      if (existingSelf) {
+        return res.status(400).json({ 
+          message: "You already exist in this project. Cannot add another 'You'." 
+        });
+      }
+    }
+
     const partner = await Partner.create({
       name,
       project: projectId,
-      notes: notes || ""
+      notes: notes || "",
+      isSelf: isSelf || false  // ✅ Set the flag
     });
 
     res.status(201).json({
@@ -42,13 +56,13 @@ exports.addPartnerToProject = async (req, res) => {
   }
 };
 
-// Get all partners for a project
+// Get all partners for a project - UPDATED to show YOU first
 exports.getProjectPartners = async (req, res) => {
   try {
     const { projectId } = req.params;
 
     const partners = await Partner.find({ project: projectId, isActive: true })
-      .sort({ name: 1 });
+      .sort({ isSelf: -1, name: 1 });  // ✅ Show YOU first, then alphabetically
 
     res.json({
       success: true,
@@ -63,17 +77,32 @@ exports.getProjectPartners = async (req, res) => {
 exports.updatePartner = async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, notes } = req.body;
+    const { name, notes, isSelf } = req.body;  // ✅ Added isSelf
 
-    const partner = await Partner.findByIdAndUpdate(
-      id,
-      { name, notes },
-      { new: true, runValidators: true }
-    );
-
+    const partner = await Partner.findById(id);
     if (!partner) {
       return res.status(404).json({ message: "Partner not found" });
     }
+
+    // ✅ If updating to isSelf true, check no other self exists
+    if (isSelf && !partner.isSelf) {
+      const existingSelf = await Partner.findOne({ 
+        project: partner.project, 
+        isSelf: true,
+        _id: { $ne: id }
+      });
+      if (existingSelf) {
+        return res.status(400).json({ 
+          message: "You already exist in this project. Cannot have another 'You'." 
+        });
+      }
+    }
+
+    partner.name = name || partner.name;
+    partner.notes = notes || partner.notes;
+    partner.isSelf = isSelf !== undefined ? isSelf : partner.isSelf;
+    
+    await partner.save();
 
     res.json({
       success: true,
@@ -118,10 +147,10 @@ exports.removePartner = async (req, res) => {
 };
 
 // ============================================
-// FIXED: PARTNER TRANSFERS (NO DOUBLE COUNTING)
+// PARTNER TRANSFERS - UPDATED WITH isSelf
 // ============================================
 
-// Create partner transfer - NO duplicate expense/income created
+// Create partner transfer - UPDATED to use isSelf
 exports.createPartnerTransfer = async (req, res) => {
   try {
     const { projectId } = req.params;
@@ -165,8 +194,8 @@ exports.createPartnerTransfer = async (req, res) => {
       return res.status(400).json({ message: "From and To partners cannot be same" });
     }
 
-    // Check if "Me" is involved in this transaction
-    const isMeInvolved = (fromPartner.name === "Me" || toPartner.name === "Me");
+    // ✅ FIXED: Check if YOU are involved using isSelf flag (NOT string comparison)
+    const isMeInvolved = fromPartner.isSelf || toPartner.isSelf;
 
     // Create base transaction data
     const transactionData = {
@@ -180,17 +209,16 @@ exports.createPartnerTransfer = async (req, res) => {
     };
 
     // ============================================
-    // CASE 1: "Me" is NOT involved - Simple record
+    // CASE 1: YOU are NOT involved - Simple record
     // ============================================
     if (!isMeInvolved) {
-      // Just store the transaction - NO account movement needed
       transactionData.paymentMode = "internal";
       const transaction = await Transaction.create(transactionData);
 
       const populated = await Transaction.findById(transaction._id)
         .populate("project", "name")
-        .populate("fromPartner", "name")
-        .populate("toPartner", "name");
+        .populate("fromPartner", "name isSelf")
+        .populate("toPartner", "name isSelf");
 
       return res.status(201).json({
         success: true,
@@ -200,19 +228,17 @@ exports.createPartnerTransfer = async (req, res) => {
     }
 
     // ============================================
-    // CASE 2: "Me" IS involved - Track how money moved
+    // CASE 2: YOU ARE involved - Track money movement
     // ============================================
     
-    // Payment mode is required when Me is involved
     if (!paymentMode) {
       return res.status(400).json({ 
-        message: "Payment mode is required when you (Me) are involved" 
+        message: "Payment mode is required when you are involved" 
       });
     }
 
     transactionData.paymentMode = paymentMode;
 
-    // If paying from bank, track which account
     if (paymentMode !== "cash" && paymentMode !== "internal") {
       if (!paymentAccountId) {
         return res.status(400).json({ 
@@ -228,22 +254,18 @@ exports.createPartnerTransfer = async (req, res) => {
       transactionData.paymentAccount = paymentAccountId;
     }
 
-    // ✅ FIXED: ONLY create ONE transaction - the partner transfer itself
-    // NO separate expense/income created
+    // Create ONLY ONE transaction
     const transaction = await Transaction.create(transactionData);
 
     const populated = await Transaction.findById(transaction._id)
       .populate("project", "name")
-      .populate("fromPartner", "name")
-      .populate("toPartner", "name")
+      .populate("fromPartner", "name isSelf")
+      .populate("toPartner", "name isSelf")
       .populate("paymentAccount", "name type");
 
     res.status(201).json({
       success: true,
-      data: populated,
-      message: isMeInvolved ? 
-        "Partner transfer recorded (your money movement tracked)" : 
-        "Partner transfer recorded"
+      data: populated
     });
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -289,8 +311,8 @@ exports.getProjectPartnerTransactions = async (req, res) => {
     }
     
     const transactions = await Transaction.find(filter)
-      .populate("fromPartner", "name")
-      .populate("toPartner", "name")
+      .populate("fromPartner", "name isSelf")
+      .populate("toPartner", "name isSelf")
       .populate("paymentAccount", "name type")
       .sort({ date: -1 });
 
@@ -304,6 +326,7 @@ exports.getProjectPartnerTransactions = async (req, res) => {
       partnerSummary[p._id.toString()] = {
         _id: p._id,
         name: p.name,
+        isSelf: p.isSelf,  // ✅ Include isSelf flag
         gave: 0,
         received: 0,
         net: 0,
@@ -347,9 +370,7 @@ exports.getProjectPartnerTransactions = async (req, res) => {
       }
     });
 
-    // ============================================
-    // FIXED: Settlement algorithm with SORTING
-    // ============================================
+    // Calculate settlements needed
     const settlements = [];
     const balances = {};
     
@@ -361,9 +382,9 @@ exports.getProjectPartnerTransactions = async (req, res) => {
     let debtors = Object.keys(balances).filter(id => balances[id] < 0);
     let creditors = Object.keys(balances).filter(id => balances[id] > 0);
 
-    // ✅ FIX: Sort debtors by most negative first, creditors by most positive first
-    debtors.sort((a, b) => balances[a] - balances[b]); // Most negative first
-    creditors.sort((a, b) => balances[b] - balances[a]); // Most positive first
+    // Sort debtors by most negative first, creditors by most positive first
+    debtors.sort((a, b) => balances[a] - balances[b]);
+    creditors.sort((a, b) => balances[b] - balances[a]);
 
     let i = 0, j = 0;
     while (i < debtors.length && j < creditors.length) {
@@ -379,8 +400,10 @@ exports.getProjectPartnerTransactions = async (req, res) => {
         settlements.push({
           from: partnerSummary[debtorId].name,
           fromId: debtorId,
+          fromIsSelf: partnerSummary[debtorId].isSelf,  // ✅ Include flag
           to: partnerSummary[creditorId].name,
           toId: creditorId,
+          toIsSelf: partnerSummary[creditorId].isSelf,  // ✅ Include flag
           amount: settleAmount,
           reason: `${partnerSummary[debtorId].name} pays ${partnerSummary[creditorId].name} ₹${settleAmount}`
         });
@@ -389,7 +412,7 @@ exports.getProjectPartnerTransactions = async (req, res) => {
       balances[debtorId] += settleAmount;
       balances[creditorId] -= settleAmount;
       
-      if (Math.abs(balances[debtorId]) < 0.01) i++; // Close to zero
+      if (Math.abs(balances[debtorId]) < 0.01) i++;
       if (Math.abs(balances[creditorId]) < 0.01) j++;
     }
 
@@ -398,7 +421,11 @@ exports.getProjectPartnerTransactions = async (req, res) => {
       data: {
         projectId,
         projectName: project.name,
-        partners: partners.map(p => ({ _id: p._id, name: p.name })),
+        partners: partners.map(p => ({ 
+          _id: p._id, 
+          name: p.name,
+          isSelf: p.isSelf  // ✅ Include flag
+        })),
         transactions,
         partnerSummary: Object.values(partnerSummary),
         settlements,
@@ -411,7 +438,7 @@ exports.getProjectPartnerTransactions = async (req, res) => {
   }
 };
 
-// Get partner settlement report
+// Get partner settlement report - UPDATED with isSelf
 exports.getPartnerSettlementReport = async (req, res) => {
   try {
     const { projectId } = req.params;
@@ -425,7 +452,7 @@ exports.getPartnerSettlementReport = async (req, res) => {
     const transactions = await Transaction.find({
       project: projectId,
       type: "partner-transfer"
-    }).populate("fromPartner toPartner", "name");
+    }).populate("fromPartner toPartner", "name isSelf");
 
     const partnerNet = {};
     const partnerDetails = {};
@@ -433,7 +460,8 @@ exports.getPartnerSettlementReport = async (req, res) => {
     partners.forEach(p => {
       partnerNet[p._id.toString()] = 0;
       partnerDetails[p._id.toString()] = {
-        name: p.name
+        name: p.name,
+        isSelf: p.isSelf  // ✅ Include flag
       };
     });
     
@@ -445,16 +473,14 @@ exports.getPartnerSettlementReport = async (req, res) => {
       if (toId) partnerNet[toId] += t.amount;
     });
 
-    // ============================================
-    // FIXED: Settlement report with SORTING
-    // ============================================
+    // Generate settlement plan
     const settlements = [];
     const balances = { ...partnerNet };
     
     let debtorIds = Object.keys(balances).filter(id => balances[id] < 0);
     let creditorIds = Object.keys(balances).filter(id => balances[id] > 0);
 
-    // ✅ FIX: Sort for optimal settlement
+    // Sort for optimal settlement
     debtorIds.sort((a, b) => balances[a] - balances[b]);
     creditorIds.sort((a, b) => balances[b] - balances[a]);
 
@@ -472,8 +498,10 @@ exports.getPartnerSettlementReport = async (req, res) => {
         settlements.push({
           from: partnerDetails[debtorId]?.name || debtorId,
           fromId: debtorId,
+          fromIsSelf: partnerDetails[debtorId]?.isSelf || false,
           to: partnerDetails[creditorId]?.name || creditorId,
           toId: creditorId,
+          toIsSelf: partnerDetails[creditorId]?.isSelf || false,
           amount: settleAmount,
           status: "pending"
         });
@@ -489,7 +517,10 @@ exports.getPartnerSettlementReport = async (req, res) => {
     // Format partner balances with names
     const formattedBalances = {};
     Object.keys(partnerNet).forEach(id => {
-      formattedBalances[partnerDetails[id]?.name || id] = partnerNet[id];
+      formattedBalances[partnerDetails[id]?.name || id] = {
+        amount: partnerNet[id],
+        isSelf: partnerDetails[id]?.isSelf || false
+      };
     });
 
     res.json({
@@ -512,7 +543,7 @@ exports.getPartnerSettlementReport = async (req, res) => {
   }
 };
 
-// Mark settlement as completed
+// Mark settlement as completed - UPDATED with isSelf
 exports.settlePartner = async (req, res) => {
   try {
     const { projectId } = req.params;
@@ -530,8 +561,8 @@ exports.settlePartner = async (req, res) => {
       return res.status(404).json({ message: "Partner not found" });
     }
 
-    // Check if "Me" is involved
-    const isMeInvolved = (fromPartner.name === "Me" || toPartner.name === "Me");
+    // ✅ Check if YOU are involved using isSelf
+    const isMeInvolved = fromPartner.isSelf || toPartner.isSelf;
 
     // Create settlement transaction data
     const transactionData = {
@@ -545,11 +576,10 @@ exports.settlePartner = async (req, res) => {
       status: "settled"
     };
 
-    // If Me is involved, handle payment mode
     if (isMeInvolved) {
       if (!paymentMode) {
         return res.status(400).json({ 
-          message: "Payment mode is required when you (Me) are involved" 
+          message: "Payment mode is required when you are involved" 
         });
       }
       transactionData.paymentMode = paymentMode;
@@ -557,14 +587,13 @@ exports.settlePartner = async (req, res) => {
         transactionData.paymentAccount = paymentAccountId;
       }
     } else {
-      // No payment details needed for partner-to-partner settlement
       transactionData.paymentMode = "internal";
     }
 
     const settlement = await Transaction.create(transactionData);
 
     const populated = await Transaction.findById(settlement._id)
-      .populate("fromPartner toPartner", "name")
+      .populate("fromPartner toPartner", "name isSelf")
       .populate("paymentAccount", "name");
 
     res.json({
@@ -588,7 +617,7 @@ exports.updatePartnerTransfer = async (req, res) => {
       updates,
       { new: true, runValidators: true }
     ).populate("project", "name")
-     .populate("fromPartner toPartner", "name")
+     .populate("fromPartner toPartner", "name isSelf")
      .populate("paymentAccount", "name");
 
     if (!transaction) {

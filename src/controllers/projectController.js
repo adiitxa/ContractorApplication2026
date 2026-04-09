@@ -1,13 +1,28 @@
 const Project = require("../models/Project");
 const Transaction = require("../models/Transaction");
-const Partner = require("../models/Partner");
+const Partner = require("../models/Partner");  // ✅ Added
 const { Parser } = require("json2csv");
 
-// Create project
+// Create project - UPDATED to auto-create YOU
 exports.createProject = async (req, res) => {
   try {
     const project = await Project.create(req.body);
-    res.status(201).json({ success: true, data: project });
+    
+    // ✅ AUTO-CREATE "You" partner for this project
+    const youPartner = await Partner.create({
+      name: "Me",  // Default name, can be changed later
+      project: project._id,
+      notes: "Main contractor",
+      isSelf: true  // ✅ This is YOU!
+    });
+    
+    res.status(201).json({ 
+      success: true, 
+      data: {
+        project,
+        defaultPartner: youPartner  // Send to frontend
+      } 
+    });
   } catch (error) {
     res.status(400).json({ message: error.message });
   }
@@ -67,7 +82,7 @@ exports.deleteProject = async (req, res) => {
 };
 
 // ============================================
-// COMPLETE PROJECT SUMMARY WITH ALL STATS (NEW)
+// COMPLETE PROJECT SUMMARY WITH ALL STATS
 // ============================================
 exports.getProjectCompleteSummary = async (req, res) => {
   try {
@@ -102,8 +117,8 @@ exports.getProjectCompleteSummary = async (req, res) => {
       .populate("fromAccount", "name")
       .populate("toAccount", "name")
       .populate("category", "name")
-      .populate("fromPartner", "name")
-      .populate("toPartner", "name")
+      .populate("fromPartner", "name isSelf")  // ✅ Added isSelf
+      .populate("toPartner", "name isSelf")    // ✅ Added isSelf
       .sort({ date: -1 });
 
     // Separate by type
@@ -170,12 +185,14 @@ exports.getProjectCompleteSummary = async (req, res) => {
       monthlyData[month].count++;
     });
 
-    // Partner summary for this project
+    // Partner summary for this project - UPDATED with isSelf
     const partnerSummary = {};
     const partnerTransactions = partnerTransfers.map(t => ({
       date: t.date,
       from: t.fromPartner?.name,
+      fromIsSelf: t.fromPartner?.isSelf || false,  // ✅ Added
       to: t.toPartner?.name,
+      toIsSelf: t.toPartner?.isSelf || false,      // ✅ Added
       amount: t.amount,
       description: t.description,
       paymentMode: t.paymentMode
@@ -185,20 +202,36 @@ exports.getProjectCompleteSummary = async (req, res) => {
     partnerTransfers.forEach(t => {
       const from = t.fromPartner?.name;
       const to = t.toPartner?.name;
+      const fromIsSelf = t.fromPartner?.isSelf || false;
+      const toIsSelf = t.toPartner?.isSelf || false;
       
       if (from) {
-        if (!partnerSummary[from]) partnerSummary[from] = { gave: 0, received: 0, net: 0 };
-        partnerSummary[from].gave += t.amount;
-        partnerSummary[from].net -= t.amount;
+        const key = fromIsSelf ? `${from} (You)` : from;
+        if (!partnerSummary[key]) partnerSummary[key] = { 
+          name: from, 
+          isSelf: fromIsSelf,
+          gave: 0, 
+          received: 0, 
+          net: 0 
+        };
+        partnerSummary[key].gave += t.amount;
+        partnerSummary[key].net -= t.amount;
       }
       if (to) {
-        if (!partnerSummary[to]) partnerSummary[to] = { gave: 0, received: 0, net: 0 };
-        partnerSummary[to].received += t.amount;
-        partnerSummary[to].net += t.amount;
+        const key = toIsSelf ? `${to} (You)` : to;
+        if (!partnerSummary[key]) partnerSummary[key] = { 
+          name: to, 
+          isSelf: toIsSelf,
+          gave: 0, 
+          received: 0, 
+          net: 0 
+        };
+        partnerSummary[key].received += t.amount;
+        partnerSummary[key].net += t.amount;
       }
     });
 
-    // Format transactions for display
+    // Format transactions for display - UPDATED with isSelf
     const formattedTransactions = transactions.map(t => {
       let typeDisplay = t.type.replace('-', ' ').toUpperCase();
       let description = t.description;
@@ -222,7 +255,9 @@ exports.getProjectCompleteSummary = async (req, res) => {
           break;
         case "partner-transfer":
           if (t.fromPartner && t.toPartner) {
-            accountInfo = `${t.fromPartner.name} → ${t.toPartner.name}`;
+            const fromName = t.fromPartner.isSelf ? `${t.fromPartner.name} (You)` : t.fromPartner.name;
+            const toName = t.toPartner.isSelf ? `${t.toPartner.name} (You)` : t.toPartner.name;
+            accountInfo = `${fromName} → ${toName}`;
             if (t.paymentMode === "internal") {
               accountInfo += ` (internal)`;
             } else if (t.paymentMode === "cash") {
@@ -296,12 +331,13 @@ exports.getProjectCompleteSummary = async (req, res) => {
             net: data.income - data.expense,
             count: data.count
           })),
-          partnerSummary: Object.entries(partnerSummary).map(([name, data]) => ({
-            partner: name,
-            gave: data.gave,
-            received: data.received,
-            net: data.net,
-            position: data.net > 0 ? "To receive" : data.net < 0 ? "To pay" : "Settled"
+          partnerSummary: Object.values(partnerSummary).map(p => ({
+            partner: p.isSelf ? `${p.name} (You)` : p.name,
+            isSelf: p.isSelf,
+            gave: p.gave,
+            received: p.received,
+            net: p.net,
+            position: p.net > 0 ? "To receive" : p.net < 0 ? "To pay" : "Settled"
           }))
         },
         transactions: formattedTransactions,
@@ -429,19 +465,21 @@ exports.exportProjectToExcel = async (req, res) => {
       .populate("fromAccount", "name")
       .populate("toAccount", "name")
       .populate("category", "name")
-      .populate("fromPartner", "name")
-      .populate("toPartner", "name")
+      .populate("fromPartner", "name isSelf")
+      .populate("toPartner", "name isSelf")
       .sort({ date: -1 })
       .lean();
 
-    // Format for CSV
+    // Format for CSV - UPDATED with isSelf
     const formattedData = transactions.map(t => ({
       "Date": new Date(t.date).toLocaleDateString(),
       "Type": t.type.toUpperCase(),
       "From Account": t.fromAccount?.name || "-",
       "To Account": t.toAccount?.name || "-",
       "Category": t.category?.name || "-",
-      "Partner": t.fromPartner?.name || t.toPartner?.name || "-",
+      "Partner": t.fromPartner ? 
+        (t.fromPartner.isSelf ? `${t.fromPartner.name} (You)` : t.fromPartner.name) : 
+        (t.toPartner ? (t.toPartner.isSelf ? `${t.toPartner.name} (You)` : t.toPartner.name) : "-"),
       "Description": t.description || "-",
       "Amount (₹)": t.amount,
       "Project": project.name
