@@ -1,6 +1,11 @@
 const Transaction = require("../models/Transaction");
 const Partner = require("../models/Partner");
 const mongoose = require("mongoose");
+const {
+  applyTransactionPopulate,
+  normalizeTransactionRefs,
+  logTransactionPopulationState
+} = require("../utils/transactionPopulate");
 
 // ============================================
 // ✅ FIXED: Create transaction with transaction safety
@@ -11,7 +16,11 @@ exports.createTransaction = async (req, res) => {
   session.startTransaction();
   
   try {
-    const transactionData = { ...req.body };
+    const transactionData = normalizeTransactionRefs(req.body);
+
+    if (transactionData.paymentMode === "cash" || transactionData.paymentMode === "internal") {
+      transactionData.paymentAccount = null;
+    }
     
     // Handle borrow logic
     if (req.body.type === "borrow") {
@@ -81,14 +90,10 @@ exports.createTransaction = async (req, res) => {
     session.endSession();
     
     // Populate for response
-    const populated = await Transaction.findById(transaction._id)
-      .populate("project", "name")
-      .populate("fromAccount", "name type")
-      .populate("toAccount", "name type")
-      .populate("category", "name")
-      .populate("fromPartner", "name")
-      .populate("toPartner", "name")
-      .populate("paymentAccount", "name type");
+    const populated = await applyTransactionPopulate(
+      Transaction.findById(transaction._id)
+    );
+    logTransactionPopulationState("createTransaction", populated);
     
     res.status(201).json({ success: true, data: populated });
   } catch (error) {
@@ -261,17 +266,12 @@ exports.getTransactionHistory = async (req, res) => {
     sort[sortBy] = sortOrder === "desc" ? -1 : 1;
 
     // Get transactions with all populated fields
-    const transactions = await Transaction.find(filter)
-      .populate("project", "name")
-      .populate("fromAccount", "name type")
-      .populate("toAccount", "name type")
-      .populate("category", "name")
-      .populate("fromPartner", "name")
-      .populate("toPartner", "name")
-      .populate("paymentAccount", "name type")
-      .sort(sort)
-      .skip(skip)
-      .limit(parseInt(limit));
+    const transactions = await applyTransactionPopulate(
+      Transaction.find(filter)
+        .sort(sort)
+        .skip(skip)
+        .limit(parseInt(limit))
+    );
 
     // Get total count
     const total = await Transaction.countDocuments(filter);
@@ -343,21 +343,20 @@ exports.getTransactionHistory = async (req, res) => {
           break;
       }
 
+      const transactionObject = t.toObject();
+      logTransactionPopulationState("getTransactionHistory", transactionObject);
+
       return {
-        _id: t._id,
-        date: t.date,
-        type: t.type,
+        ...transactionObject,
         typeDisplay: t.type.replace('-', ' ').toUpperCase(),
-        project: t.project?.name || "Personal",
-        description: t.description || description,
-        amount: t.amount,
+        projectName: t.project?.name || "Personal",
+        displayDescription: t.description || description,
         amountDisplay: amount,
-        status,
-        category: t.category?.name,
-        account: t.fromAccount?.name || t.toAccount?.name,
-        partner: t.fromPartner?.name || t.toPartner?.name,
-        person: t.personName,
-        paymentMode: t.paymentMode
+        statusDisplay: status,
+        categoryName: t.category?.name,
+        accountName: t.fromAccount?.name || t.toAccount?.name,
+        partnerName: t.fromPartner?.name || t.toPartner?.name,
+        person: t.personName
       };
     });
 
@@ -465,16 +464,16 @@ exports.getTransactions = async (req, res) => {
     const skip = (parseInt(page) - 1) * parseInt(limit);
     
     // Execute query
-    const transactions = await Transaction.find(filter)
-      .populate("project", "name")
-      .populate("fromAccount", "name type")
-      .populate("toAccount", "name type")
-      .populate("category", "name")
-      .populate("fromPartner", "name")
-      .populate("toPartner", "name")
-      .sort({ date: -1, createdAt: -1 })
-      .skip(skip)
-      .limit(parseInt(limit));
+    const transactions = await applyTransactionPopulate(
+      Transaction.find(filter)
+        .sort({ date: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+    );
+
+    transactions.forEach((transaction) => {
+      logTransactionPopulationState("getTransactions", transaction);
+    });
 
     // Get total count
     const total = await Transaction.countDocuments(filter);
@@ -508,24 +507,23 @@ exports.getBorrowsWithRepayments = async (req, res) => {
     
     const skip = (parseInt(page) - 1) * parseInt(limit);
     
-    const borrows = await Transaction.find(filter)
-      .populate("toAccount", "name type")
-      .populate("fromAccount", "name type")
-      .populate("project", "name")
-      .sort({ date: -1 })
-      .skip(skip)
-      .limit(parseInt(limit));
+    const borrows = await applyTransactionPopulate(
+      Transaction.find(filter)
+        .sort({ date: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+    );
     
     const total = await Transaction.countDocuments(filter);
     
     // For each borrow, find its repayments
     const result = await Promise.all(borrows.map(async (borrow) => {
-      const repayments = await Transaction.find({
-        type: "repay",
-        parentBorrowId: borrow._id
-      })
-      .populate("fromAccount", "name")
-      .sort({ date: 1 });
+      const repayments = await applyTransactionPopulate(
+        Transaction.find({
+          type: "repay",
+          parentBorrowId: borrow._id
+        }).sort({ date: 1 })
+      );
       
       const totalRepaid = repayments.reduce((sum, r) => sum + r.amount, 0);
       const remainingAmount = (borrow.originalAmount || borrow.amount) - totalRepaid;
@@ -632,7 +630,8 @@ exports.repayBorrow = async (req, res) => {
   session.startTransaction();
   
   try {
-    const { amount, fromAccount, date, description } = req.body;
+    const normalizedBody = normalizeTransactionRefs(req.body);
+    const { amount, fromAccount, date, description } = normalizedBody;
     const borrowId = req.params.id;
     
     // Find the original borrow WITH LOCK
@@ -689,21 +688,23 @@ exports.repayBorrow = async (req, res) => {
     session.endSession();
     
     // Get updated borrow with repayments
-    const updatedBorrow = await Transaction.findById(borrowId)
-      .populate("toAccount", "name")
-      .populate("fromAccount", "name");
-    
-    const allRepayments = await Transaction.find({
-      type: "repay",
-      parentBorrowId: borrowId
-    }).populate("fromAccount", "name");
+    const updatedBorrow = await applyTransactionPopulate(
+      Transaction.findById(borrowId)
+    );
+
+    const allRepayments = await applyTransactionPopulate(
+      Transaction.find({
+        type: "repay",
+        parentBorrowId: borrowId
+      })
+    );
     
     res.json({
       success: true,
       message: `Repaid ₹${amount} successfully`,
       data: {
         borrow: updatedBorrow,
-        repayment,
+        repayment: await applyTransactionPopulate(Transaction.findById(repayment._id)),
         allRepayments,
         remainingAmount: newRemaining
       }
@@ -720,13 +721,9 @@ exports.repayBorrow = async (req, res) => {
 // ============================================
 exports.getTransaction = async (req, res) => {
   try {
-    const transaction = await Transaction.findById(req.params.id)
-      .populate("project", "name")
-      .populate("fromAccount", "name type")
-      .populate("toAccount", "name type")
-      .populate("category", "name")
-      .populate("fromPartner", "name")
-      .populate("toPartner", "name");
+    const transaction = await applyTransactionPopulate(
+      Transaction.findById(req.params.id)
+    );
     
     if (!transaction) {
       return res.status(404).json({ message: "Transaction not found" });
@@ -735,11 +732,15 @@ exports.getTransaction = async (req, res) => {
     // If it's a borrow, include its repayments
     let repayments = [];
     if (transaction.type === "borrow") {
-      repayments = await Transaction.find({
-        type: "repay",
-        parentBorrowId: transaction._id
-      }).populate("fromAccount", "name");
+      repayments = await applyTransactionPopulate(
+        Transaction.find({
+          type: "repay",
+          parentBorrowId: transaction._id
+        })
+      );
     }
+
+    logTransactionPopulationState("getTransaction", transaction);
     
     res.json({ 
       success: true, 
@@ -775,22 +776,26 @@ exports.updateTransaction = async (req, res) => {
       }
     }
     
-    const transaction = await Transaction.findByIdAndUpdate(
+    const updates = normalizeTransactionRefs(req.body);
+
+    if (updates.paymentMode === "cash" || updates.paymentMode === "internal") {
+      updates.paymentAccount = null;
+    }
+
+    const transaction = await applyTransactionPopulate(
+      Transaction.findByIdAndUpdate(
       req.params.id,
-      req.body,
+      updates,
       { new: true, runValidators: true }
-    )
-      .populate("project", "name")
-      .populate("fromAccount", "name type")
-      .populate("toAccount", "name type")
-      .populate("category", "name")
-      .populate("fromPartner", "name")
-      .populate("toPartner", "name");
+      )
+    );
     
     if (!transaction) {
       return res.status(404).json({ message: "Transaction not found" });
     }
     
+    logTransactionPopulationState("updateTransaction", transaction);
+
     res.json({ success: true, data: transaction });
   } catch (error) {
     res.status(400).json({ message: error.message });

@@ -2,6 +2,12 @@ const Partner = require("../models/Partner");
 const Transaction = require("../models/Transaction");
 const Project = require("../models/Project");
 const Account = require("../models/Account");
+const {
+  applyTransactionPopulate,
+  normalizeTransactionRefs,
+  ensureObjectId,
+  logTransactionPopulationState
+} = require("../utils/transactionPopulate");
 
 // ============================================
 // PARTNER MANAGEMENT - UPDATED WITH isSelf
@@ -154,15 +160,26 @@ exports.removePartner = async (req, res) => {
 exports.createPartnerTransfer = async (req, res) => {
   try {
     const { projectId } = req.params;
-    const { 
-      fromPartnerId, 
-      toPartnerId, 
-      amount, 
-      description, 
-      date,
-      paymentMode,
-      paymentAccountId
-    } = req.body;
+    const normalizedBody = normalizeTransactionRefs(req.body);
+    const fromPartnerId = ensureObjectId(
+      normalizedBody.fromPartner || req.body.fromPartnerId,
+      "fromPartner"
+    );
+    const toPartnerId = ensureObjectId(
+      normalizedBody.toPartner || req.body.toPartnerId,
+      "toPartner"
+    );
+    const paymentAccountId = ensureObjectId(
+      normalizedBody.paymentAccount || req.body.paymentAccountId,
+      "paymentAccount"
+    );
+    const { amount, description, date, paymentMode } = normalizedBody;
+
+    if (!fromPartnerId || !toPartnerId) {
+      return res.status(400).json({
+        message: "fromPartnerId and toPartnerId are required"
+      });
+    }
 
     // Verify project exists
     const project = await Project.findById(projectId);
@@ -190,7 +207,7 @@ exports.createPartnerTransfer = async (req, res) => {
     }
 
     // Validate partners are different
-    if (fromPartnerId === toPartnerId) {
+    if (fromPartnerId.toString() === toPartnerId.toString()) {
       return res.status(400).json({ message: "From and To partners cannot be same" });
     }
 
@@ -201,7 +218,7 @@ exports.createPartnerTransfer = async (req, res) => {
     const transactionData = {
       date: date || new Date(),
       type: "partner-transfer",
-      project: projectId,
+      project: ensureObjectId(projectId, "project"),
       fromPartner: fromPartnerId,
       toPartner: toPartnerId,
       description: description || `${fromPartner.name} → ${toPartner.name} ₹${amount}`,
@@ -215,10 +232,10 @@ exports.createPartnerTransfer = async (req, res) => {
       transactionData.paymentMode = "internal";
       const transaction = await Transaction.create(transactionData);
 
-      const populated = await Transaction.findById(transaction._id)
-        .populate("project", "name")
-        .populate("fromPartner", "name isSelf")
-        .populate("toPartner", "name isSelf");
+      const populated = await applyTransactionPopulate(
+        Transaction.findById(transaction._id)
+      );
+      logTransactionPopulationState("createPartnerTransfer:internal", populated);
 
       return res.status(201).json({
         success: true,
@@ -252,16 +269,17 @@ exports.createPartnerTransfer = async (req, res) => {
       }
       
       transactionData.paymentAccount = paymentAccountId;
+    } else {
+      transactionData.paymentAccount = null;
     }
 
     // Create ONLY ONE transaction
     const transaction = await Transaction.create(transactionData);
 
-    const populated = await Transaction.findById(transaction._id)
-      .populate("project", "name")
-      .populate("fromPartner", "name isSelf")
-      .populate("toPartner", "name isSelf")
-      .populate("paymentAccount", "name type");
+    const populated = await applyTransactionPopulate(
+      Transaction.findById(transaction._id)
+    );
+    logTransactionPopulationState("createPartnerTransfer", populated);
 
     res.status(201).json({
       success: true,
@@ -310,11 +328,13 @@ exports.getProjectPartnerTransactions = async (req, res) => {
       ];
     }
     
-    const transactions = await Transaction.find(filter)
-      .populate("fromPartner", "name isSelf")
-      .populate("toPartner", "name isSelf")
-      .populate("paymentAccount", "name type")
-      .sort({ date: -1 });
+    const transactions = await applyTransactionPopulate(
+      Transaction.find(filter).sort({ date: -1 })
+    );
+
+    transactions.forEach((transaction) => {
+      logTransactionPopulationState("getProjectPartnerTransactions", transaction);
+    });
 
     // Get all partners for this project
     const partners = await Partner.find({ project: projectId, isActive: true });
@@ -449,10 +469,12 @@ exports.getPartnerSettlementReport = async (req, res) => {
     }
     
     const partners = await Partner.find({ project: projectId, isActive: true });
-    const transactions = await Transaction.find({
-      project: projectId,
-      type: "partner-transfer"
-    }).populate("fromPartner toPartner", "name isSelf");
+    const transactions = await applyTransactionPopulate(
+      Transaction.find({
+        project: projectId,
+        type: "partner-transfer"
+      })
+    );
 
     const partnerNet = {};
     const partnerDetails = {};
@@ -547,18 +569,41 @@ exports.getPartnerSettlementReport = async (req, res) => {
 exports.settlePartner = async (req, res) => {
   try {
     const { projectId } = req.params;
-    const { fromPartnerId, toPartnerId, amount, description, date, paymentMode, paymentAccountId } = req.body;
+    const normalizedBody = normalizeTransactionRefs(req.body);
+    const fromPartnerId = ensureObjectId(
+      normalizedBody.fromPartner || req.body.fromPartnerId,
+      "fromPartner"
+    );
+    const toPartnerId = ensureObjectId(
+      normalizedBody.toPartner || req.body.toPartnerId,
+      "toPartner"
+    );
+    const paymentAccountId = ensureObjectId(
+      normalizedBody.paymentAccount || req.body.paymentAccountId,
+      "paymentAccount"
+    );
+    const { amount, description, date, paymentMode } = normalizedBody;
+
+    if (!fromPartnerId || !toPartnerId) {
+      return res.status(400).json({
+        message: "fromPartnerId and toPartnerId are required"
+      });
+    }
 
     const project = await Project.findById(projectId);
     if (!project) {
       return res.status(404).json({ message: "Project not found" });
     }
 
-    const fromPartner = await Partner.findById(fromPartnerId);
-    const toPartner = await Partner.findById(toPartnerId);
+    const fromPartner = await Partner.findOne({ _id: fromPartnerId, project: projectId, isActive: true });
+    const toPartner = await Partner.findOne({ _id: toPartnerId, project: projectId, isActive: true });
 
     if (!fromPartner || !toPartner) {
-      return res.status(404).json({ message: "Partner not found" });
+      return res.status(404).json({ message: "Partner not found in this project" });
+    }
+
+    if (fromPartnerId.toString() === toPartnerId.toString()) {
+      return res.status(400).json({ message: "From and To partners cannot be same" });
     }
 
     // ✅ Check if YOU are involved using isSelf
@@ -568,7 +613,7 @@ exports.settlePartner = async (req, res) => {
     const transactionData = {
       date: date || new Date(),
       type: "partner-transfer",
-      project: projectId,
+      project: ensureObjectId(projectId, "project"),
       fromPartner: fromPartnerId,
       toPartner: toPartnerId,
       description: description || `Settlement: ${fromPartner.name} → ${toPartner.name} ₹${amount}`,
@@ -583,18 +628,33 @@ exports.settlePartner = async (req, res) => {
         });
       }
       transactionData.paymentMode = paymentMode;
-      if (paymentAccountId) {
+      if (paymentMode !== "cash" && paymentMode !== "internal") {
+        if (!paymentAccountId) {
+          return res.status(400).json({
+            message: `Account is required for ${paymentMode} payment`
+          });
+        }
+
+        const account = await Account.findById(paymentAccountId);
+        if (!account) {
+          return res.status(404).json({ message: "Payment account not found" });
+        }
+
         transactionData.paymentAccount = paymentAccountId;
+      } else {
+        transactionData.paymentAccount = null;
       }
     } else {
       transactionData.paymentMode = "internal";
+      transactionData.paymentAccount = null;
     }
 
     const settlement = await Transaction.create(transactionData);
 
-    const populated = await Transaction.findById(settlement._id)
-      .populate("fromPartner toPartner", "name isSelf")
-      .populate("paymentAccount", "name");
+    const populated = await applyTransactionPopulate(
+      Transaction.findById(settlement._id)
+    );
+    logTransactionPopulationState("settlePartner", populated);
 
     res.json({
       success: true,
@@ -610,19 +670,37 @@ exports.settlePartner = async (req, res) => {
 exports.updatePartnerTransfer = async (req, res) => {
   try {
     const { id } = req.params;
-    const updates = req.body;
+    const updates = normalizeTransactionRefs(req.body);
 
-    const transaction = await Transaction.findByIdAndUpdate(
-      id,
-      updates,
-      { new: true, runValidators: true }
-    ).populate("project", "name")
-     .populate("fromPartner toPartner", "name isSelf")
-     .populate("paymentAccount", "name");
+    if (updates.fromPartner) {
+      updates.fromPartner = ensureObjectId(updates.fromPartner, "fromPartner");
+    }
+
+    if (updates.toPartner) {
+      updates.toPartner = ensureObjectId(updates.toPartner, "toPartner");
+    }
+
+    if (updates.paymentAccount !== undefined) {
+      updates.paymentAccount = ensureObjectId(updates.paymentAccount, "paymentAccount");
+    }
+
+    if (updates.paymentMode === "cash" || updates.paymentMode === "internal") {
+      updates.paymentAccount = null;
+    }
+
+    const transaction = await applyTransactionPopulate(
+      Transaction.findByIdAndUpdate(
+        id,
+        updates,
+        { new: true, runValidators: true }
+      )
+    );
 
     if (!transaction) {
       return res.status(404).json({ message: "Partner transfer not found" });
     }
+
+    logTransactionPopulationState("updatePartnerTransfer", transaction);
 
     res.json({
       success: true,
